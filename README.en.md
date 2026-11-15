@@ -185,7 +185,7 @@ none of these install paths needs a build approval:
 dsh plugin --profile <profile> add dsh-plugin-remover
 
 # from the GitHub source
-dsh plugin --profile <profile> add github:OWNER/dsh-plugin-remover
+dsh plugin --profile <profile> add github:ee1801446016/dsh-plugin-remover
 
 # from a local directory (a link install: edits take effect immediately)
 dsh plugin --profile <profile> add ./dsh-plugin-remover
