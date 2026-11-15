@@ -185,7 +185,7 @@ trash/
 dsh plugin --profile <profile> add dsh-plugin-remover
 
 # 从 GitHub 源码
-dsh plugin --profile <profile> add github:OWNER/dsh-plugin-remover
+dsh plugin --profile <profile> add github:ee1801446016/dsh-plugin-remover
 
 # 从本地目录（链接安装，改文件即刻生效）
 dsh plugin --profile <profile> add ./dsh-plugin-remover
