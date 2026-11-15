@@ -51,7 +51,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/dsh-plugin-remover.git"
+   "url": "git+https://github.com/ee1801446016/dsh-plugin-remover.git"
   },
   "dsh": {
     "manifestVersion": 1,
