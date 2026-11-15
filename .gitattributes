@@ -1,0 +1,11 @@
+# Keep the checked-out bytes identical to the published tarball.
+#
+# These files are ECMAScript modules loaded by Node and a YAML patch read by the
+# DSH loader. Without this, Git's autocrlf rewrites every line ending to CRLF on
+# a Windows checkout, so a clone and an npm install produce different bytes for
+# the same version — and a hash-based verification would disagree with itself.
+* text=auto eol=lf
+
+# The storefront icon is binary; never touch its bytes.
+*.png binary
+*.svg text eol=lf
