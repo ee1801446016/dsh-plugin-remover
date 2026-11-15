@@ -1,0 +1,68 @@
+{
+  "name": "dsh-plugin-remover",
+  "version": "1.0.0",
+  "description": "在会话菜单里删除一个对话，并按需带走它产出的文件、读过的文件、子代理对话与附件；删除先进回收站，可整组或单文件恢复，并可设保留天数与容量上限；侧边栏右下角的回收站入口可在插件页开关。· Delete a conversation together with what it produced, behind a restorable recycle bin.",
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "verify",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "assets"
+  ],
+  "scripts": {
+    "verify": "node verify/verify-host.mjs",
+    "verify:client": "node verify/verify-client.cjs"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "plugin",
+    "session",
+    "conversation",
+    "delete",
+    "remove",
+    "trash",
+    "recycle-bin",
+    "restore",
+    "cleanup"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/dsh-plugin-remover.git"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  }
+}

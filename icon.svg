@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Conversation cleanup and recycle bin">
+  <g fill="none" stroke="#4A6CD4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10 10h36a4 4 0 0 1 4 4v22a4 4 0 0 1-4 4H24l-9 8v-8h-5a4 4 0 0 1-4-4V14a4 4 0 0 1 4-4z"/>
+    <path d="M18 20h20M18 28h13" stroke="#9AA7C7"/>
+  </g>
+  <g fill="none" stroke="#C4553F" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 34h18M45 34v18a4 4 0 0 0 4 4h2a4 4 0 0 0 4-4V34"/>
+    <path d="M44 34l1-4h8l1 4M49 41v9M54 41v9"/>
+  </g>
+</svg>

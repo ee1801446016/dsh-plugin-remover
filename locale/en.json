@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Conversation remover and recycle bin",
+    "description": "Delete a conversation from its row menu and take with it the files it produced, the files it read, its subagent conversations, and the attachments no other conversation references; every file can be expanded to show its source directory and the conversations behind it. Deletion goes to a recycle bin and can be restored as a whole group or one file at a time, with configurable retention and a size cap. A recycle-bin entry sits at the foot of the sidebar and can be switched off on this plugin's page, which also carries the hidden subagent conversations and both settings. The reversible path asks for no acknowledgement; only emptying the recycle bin, deleting permanently, and a deletion too large to store ask for one."
+  }
+}
