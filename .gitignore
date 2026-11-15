@@ -1,0 +1,12 @@
+# Dependency and build output that must never be committed.
+node_modules/
+*.tgz
+
+# Editor and OS clutter.
+.DS_Store
+Thumbs.db
+*.swp
+
+# Workspace-only notes: how this checkout is edited and synced, not part of the
+# package or the public repository.
+WORKSPACE.md
