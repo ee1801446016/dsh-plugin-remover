@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-remover",
-  "version": "1.0.0",
-  "description": "在会话菜单里删除一个对话，并按需带走它产出的文件、读过的文件、子代理对话与附件；删除先进回收站，可整组或单文件恢复，并可设保留天数与容量上限；侧边栏右下角的回收站入口可在插件页开关。· Delete a conversation together with what it produced, behind a restorable recycle bin.",
+  "version": "1.4.0",
+  "description": "在会话菜单里删除一个对话，并按需带走它产出的文件、会话期间变更的文件、子代理对话与附件，也可以只删文件留下对话；读过的文件只列出、不删除。同一份内容只出现一次，对话框分区折叠一屏看全，删除先进回收站，可整组/单文件/批量恢复并回到原工作区。· Delete a conversation together with what it produced, keep the conversation and delete only its files, and restore either from a restorable recycle bin. Files it merely read are listed, never deleted.",
   "icon": "./icon.svg",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,11 @@
   ],
   "scripts": {
     "verify": "node verify/verify-host.mjs",
-    "verify:client": "node verify/verify-client.cjs"
+    "verify:client": "node verify/verify-client.cjs",
+    "verify:render": "node verify/verify-render.mjs",
+    "verify:routes": "node verify/verify-routes-120.mjs",
+    "verify:runtime": "node verify/verify-runtime.mjs",
+    "verify:scan": "node verify/verify-scan.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
@@ -51,7 +55,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-   "url": "git+https://github.com/ee1801446016/dsh-plugin-remover.git"
+    "url": "git+https://github.com/ee1801446016/dsh-plugin-remover.git"
   },
   "dsh": {
     "manifestVersion": 1,

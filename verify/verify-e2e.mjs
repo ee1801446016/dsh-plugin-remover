@@ -135,8 +135,8 @@ async function main() {
   equal('it reports no children for a leaf', Array.isArray(plan.children), true)
   check('it reports the trash headroom', typeof plan.trash.usedBytes === 'number')
   const artifactIds = (plan.artifacts.items ?? []).map(row => row.id)
-  const referencedIds = []
-  console.log(`  artifacts: ${String(artifactIds.length)}, referenced: ${String((plan.referenced.items ?? []).length)}`)
+  console.log(`  artifacts: ${String(artifactIds.length)}, referenced (listed only): ${String((plan.referenced.items ?? []).length)}`)
+  equal('the referenced group is marked non-deletable', plan.referenced.deletable, false)
   for (const row of plan.artifacts.items ?? []) {
     check(`artifact ${sessionId} reports a source directory`, typeof row.dir === 'string' && row.dir !== '')
     check('artifact reports provenance', Array.isArray(row.sources) && row.sources.length > 0)
@@ -148,7 +148,6 @@ async function main() {
     sessionId,
     include: { record: true, cache: true, children: true, attachments: false },
     artifactIds,
-    referencedIds,
     childIds: (plan.children ?? []).map(row => row.sessionId),
   })
   equal('the purge answers', purge.status, 200)
@@ -203,7 +202,6 @@ async function main() {
     sessionId,
     include: { record: true, cache: true, children: true, attachments: false },
     artifactIds,
-    referencedIds,
     childIds: (plan.children ?? []).map(row => row.sessionId),
   })
   equal('the second purge answers', again.status, 200)

@@ -216,7 +216,11 @@ const stylesheet = mountedStyles[0]
 equal('the stylesheet is a style element', stylesheet?.tagName, 'STYLE')
 equal('the stylesheet has a stable id', stylesheet?.id, 'dsh-plugin-remover-styles')
 const css = String(stylesheet?.textContent ?? '')
-check('the dialog is widened', css.includes('-dialog { width: min(760px'))
+// 1.2.0 narrowed the dialog from 760 to 720 px: the compact sectioned layout no
+// longer needs the extra width, and a narrower dialog leaves more of the page
+// visible behind it. The invariant is "wider than the shipped 380 px and capped
+// to the viewport", not the exact number.
+check('the dialog is widened', /-dialog \{ width: min\(7\d\dpx, calc\(100vw - 48px\)\);/.test(css))
 // The modal root pads 24 px top and bottom; the cap has to leave that room or
 // the dialog overflows the padding and gets clipped.
 check('the dialog is height-capped inside the root padding', css.includes('max-height: calc(100vh - 48px)'))
@@ -225,7 +229,15 @@ check('the content column scrolls', css.includes('-content { min-height: 0; over
 check('wheel scrolling stays inside the dialog', css.includes('overscroll-behavior: contain'))
 check('the header stays put while scrolling', css.includes('position: sticky; top: 0'))
 check('the footer keeps its height when the dialog is capped', css.includes('-dialog > :last-child { flex: none; }'))
-equal('one dialog passes the wide class', (source.match(/className: DIALOG_CLASS/g) ?? []).length, 1)
+// The compact layout puts six sections into one scrollable column with a sticky
+// summary bar on top; without a capped per-list height, one long list would push
+// every other section — and the footer — out of reach again.
+check('the summary bar is pinned above the sections', css.includes('-summary {') && css.includes('-summary'))
+check('each section header is a single line', css.includes('-section-head {'))
+check('a section reports its count', css.includes('-section-count {'))
+check('a section reports its byte total', css.includes('-section-summary {'))
+check('long lists scroll inside their section', css.includes('-list { display: grid; gap: 2px; max-height: 150px; overflow-y: auto'))
+check('one dialog passes the wide class', (source.match(/className: DIALOG_CLASS/g) ?? []).length, 1)
 // Two panels plus the boundary's own fallback dialog.
 equal('the panels and the boundary fallback pass the narrow class', (source.match(/className: NARROW_DIALOG_CLASS/g) ?? []).length, 3)
 equal('every dialog passes the content class', (source.match(/contentClassName: CONTENT_CLASS/g) ?? []).length, 4)
@@ -240,8 +252,13 @@ console.log('# recycle-bin layout')
 // without overlapping the title once the panel is narrow.
 check('the group header stacks its lines', trashSlice.includes("key: 'head',\n              style: { display: 'grid', gap: 4 }"))
 check('the group action line wraps', trashSlice.includes("display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px 8px'"))
-check('the group title ellipsizes instead of overflowing', trashSlice.includes("flex: '1 1 auto',\n                    minWidth: 0,"))
+// The title now ellipsizes inside the toggle button, which owns the width; the
+// invariant is that it truncates instead of pushing the buttons off the row.
+check('the group title ellipsizes instead of overflowing',
+  trashSlice.includes("textOverflow: 'ellipsis',\n                      whiteSpace: 'nowrap',"))
 check('the group title no longer has a fixed width cap', !trashSlice.includes('maxWidth: 280'))
+check('the group row is multi-select',
+  trashSlice.includes("type: 'checkbox',\n                  checked: groupSelected,"))
 check('the item row stacks its lines', trashSlice.includes("style: { display: 'grid', gap: 3, padding: '4px 6px'"))
 check('the item action line wraps', trashSlice.includes("key: 'actions',\n                      style: { display: 'flex', flexWrap: 'wrap', gap: 4 }"))
 // The modal subtitle already carries this sentence.
@@ -261,19 +278,171 @@ check('the recycle-bin item rows offer Details too', source.includes("tinyButton
 check('the details are inline, not a nested modal', source.includes('gridColumn: \'1 / -1\''))
 
 console.log('# required sections')
-for (const key of ['section.record', 'section.children', 'section.artifacts', 'section.referenced', 'section.attachments']) {
+for (const key of ['section.record', 'section.children', 'section.artifacts', 'section.referenced', 'section.changed', 'section.attachments']) {
   check(`the dialog renders ${key}`, source.includes(`t('${key}')`))
 }
 check('the produced files are selected by default',
-  source.includes("setArtifactIds((payload.artifacts?.items ?? []).map(row => row.id))"))
-check('the referenced files are NOT selected by default',
-  source.includes('const [referencedIds, setReferencedIds] = React.useState([])'))
+  source.includes('setArtifactIds((normalized.artifacts.items).map(row => row.id))'))
+// 1.4.0: referenced files are listed, never deleted, so there is no selection
+// state for them at all. The absence is the guarantee — a checkbox that cannot
+// act is worse than no checkbox, and a state variable would be a field the
+// request has no use for.
+check('the referenced files have no selection state',
+  !source.includes('referencedIds') && !source.includes('setReferencedIds'))
+check('a referenced row is rendered read-only',
+  source.includes('readOnly: true'))
+check('the read-only row drops its checkbox',
+  source.includes('const locked = readOnly === true')
+  && source.includes('locked\n            ? null\n            : React.createElement(\'input\','))
+check('the outside files are NOT selected by default',
+  source.includes('const [outsideIds, setOutsideIds] = React.useState([])'))
+check('the changed files are NOT selected by default, and cannot default to all',
+  source.includes('const [changedIds, setChangedIds] = React.useState([])'))
+check('the changed group never seeds itself from the scan',
+  !/setChangedIds\((payload|plan)\.changed/.test(source))
+// Regression: a Host half from 1.0.0 returns no `changed` field at all. The
+// first attempt guarded with `=== null`, which is true for `null` but not for
+// `undefined`, so reading `window.start` threw inside render and the dialog
+// could not be closed. Normalising at the response boundary is what prevents it.
+check('the scan response is normalised before it is rendered',
+  source.includes('changed: payload?.changed ?? { items: [], totalBytes: 0, truncated: false, window: null }'))
+check('a missing changed group is normalised too',
+  source.includes("attachments: payload?.attachments ?? { ids: [], items: [] }"))
+check('the window is checked for undefined, not only null',
+  source.includes('window !== undefined'))
+// Regression: the error fallback used an empty onClose, so a crash left a modal
+// with no way out — the user had to reload the whole app.
+check('the error fallback can be dismissed', !/onClose: \(\) => \{\},\n            title: this\.props\.title/.test(source))
+check('the error fallback closes through the store',
+  source.includes('onClose: () => { purgeStore.close() }'))
 check('the subagent conversations are selected by default',
-  source.includes("setChildIds((payload.children ?? []).map(row => row.sessionId))"))
+  source.includes('setChildIds((normalized.children).map(row => row.sessionId))'))
 check('the referenced list carries a warning', source.includes("t('referenced.warning')"))
+check('the changed list carries its own warning', source.includes("t('changed.warning')"))
+check('the changed group states its time window', source.includes("t('changed.window')"))
+check('the changed group explains a timestamp-less log', source.includes("t('changed.noWindow')"))
+check('the dialog sends changedIds, never paths', /changedIds,/.test(source))
+check('attachment names are shown, not only digests', source.includes("item.name") && source.includes("t('attachments.nameless')"))
+
+console.log('# files outside the working directory')
+// 1.3.0: these were refused outright, which made a file the log named in another
+// directory impossible to delete from the dialog. 1.4.0 narrows the section to
+// files the conversation *produced*: everything it merely read is listed in the
+// read-only section instead, whichever directory it sat in.
+check('the outside section exists', source.includes("t('section.outside')"))
+check('the outside section states the risk', source.includes("t('outside.warning')"))
+check('the outside rows are their own list', source.includes("className: `${STYLE_ID}-list`") && source.includes("key: 'outside-list'"))
+check('an outside row is ticked individually',
+  source.includes('onToggle: () => { toggleIn(setOutsideIds, outsideIds, row.id) }'))
+check('the outside section holds produced files only',
+  source.includes('const outside = artifactsOutside'))
+check('outside ids join artifactIds, the one namespace they belong to',
+  source.includes('artifactIds: [...(artifactIds ?? []), ...outsideIds],'))
+check('the outside section is part of expand-all',
+  source.includes("expandAll(['record', 'children', 'artifacts', 'referenced', 'outside', 'changed', 'attachments'])"))
+
+console.log('# one picture, one row')
+// The same image exists twice on disk: the file the user had, and the store's
+// copy. Listing both asked the reader to choose between two checkboxes for one
+// picture, and ticking the wrong one deleted a file they could not see.
+check('a mirrored attachment is recognised', source.includes('item.mirrorOf'))
+check('mirrored attachments are not listed as their own rows',
+  source.includes('const attachmentStandalone = attachmentItems.filter('))
+check('the fold is explained in the attachment section', source.includes("t('attachments.mirrors')"))
+check('the file detail names the store copy', source.includes("t('detail.mirror')"))
+check('the file detail explains the copy is shared', source.includes("t('detail.mirrorHint')"))
+check('the result page reports the copies it took', source.includes("t('done.mirrors')"))
+
+console.log('# a refusal is a message, not a number')
+check('refused rows are rendered with their reason', source.includes("function refusedList("))
+check('the produced group renders its refusals', source.includes('artifacts-refused-list'))
+check('the referenced group renders its refusals', source.includes('referenced-refused-list'))
+check('the refusal list is capped', source.includes('const MAX_REFUSED_SHOWN = '))
+check('the cap is summarised', source.includes("t('refused.more')"))
+
+console.log('# the compact dialog')
+// Every section has to be collapsible: six always-open lists each with their own
+// scrollbar is what made this dialog feel enormous.
+check('the dialog renders collapsible sections', source.includes('React.createElement(Section, {'))
+check('a section reports its own count', source.includes("className: `${STYLE_ID}-section-count`"))
+check('a section reports its own summary', source.includes("className: `${STYLE_ID}-section-summary`"))
+check('a section exposes its expanded state', source.includes("'aria-expanded': expanded,"))
+check('a section points at its body', source.includes("'aria-controls': `${id}-body`"))
+check('the dialog opens on the produced files only',
+  source.includes("const [expandedSections, setExpandedSections] = React.useState({ artifacts: true })"))
+check('the dialog can expand every group at once', source.includes('expandAll('))
+check('the dialog can collapse every group at once', source.includes('collapseAll'))
+check('the summary bar carries the counts',
+  source.includes("t('summary.selection')") || source.includes("t('summary.kept')"))
+check('the summary bar is the sticky top of the content column',
+  source.includes('className: SUMMARY_CLASS'))
+// The filter used to sit below every list, which meant scrolling to reach it.
+{
+  const searchAt = source.indexOf("placeholder: t('search.placeholder')")
+  const summaryAt = source.indexOf("className: SUMMARY_CLASS")
+  const artifactsAt = source.indexOf("title: t('section.artifacts')")
+  check('the filter sits in the summary bar, above the sections',
+    searchAt > summaryAt && (artifactsAt === -1 || searchAt < artifactsAt))
+}
+
+console.log('# keeping the conversation while deleting its files')
+check('the dialog offers a record switch', source.includes("t('record.toggle')"))
+check('the record switch is on by default',
+  source.includes('const [includeRecord, setIncludeRecord] = React.useState(true)'))
+check('the record switch reaches the purge request', source.includes('record: includeRecord,'))
+check('unticking it also frees the projection cache', source.includes('cache: includeRecord,'))
+check('the attachments follow the record switch', source.includes('attachments: includeRecord && includeAttachments,'))
+check('the dialog explains what a kept conversation means', source.includes("t('record.kept')"))
+check('the dialog says which workspace a restore targets', source.includes("t('record.workspace')"))
+check('the dialog disables the attachment box when the record is kept',
+  source.includes('const attachmentsEnabled = includeRecord'))
+check('the disabled attachment box explains itself', source.includes("t('record.forcesAttachments')"))
+check('a disabled checkbox line is reachable in the shared row helper',
+  source.includes('disabled: off,'))
+
+console.log('# recycle-bin batch operations')
+check('a group row can be multi-selected', source.includes('const [selectedGroups, setSelectedGroups] = React.useState({})'))
+check('a file row can be multi-selected', source.includes('const [selectedItems, setSelectedItems] = React.useState({})'))
+check('the panel can select every group', source.includes("t('trash.selectAll')"))
+check('the panel can clear the selection', source.includes("t('trash.selectNone')"))
+check('the panel restores the selection in one request', source.includes("t('trash.restoreSelection')"))
+check('the restore request carries groupKeys and items',
+  source.includes("run('/trash/restore', { groupKeys: selection.groupKeys, items: selection.items }"))
+check('a selected group is not also sent as loose items',
+  source.includes('groupKeys.includes(row.groupKey) !== true'))
+check('the panel permanently deletes the selection', source.includes("t('trash.deleteSelection')"))
+check('the batch delete names how much it removes',
+  source.includes("t('trash.confirmBodySelection')"))
+check('the batch delete still needs the acknowledgement',
+  source.includes('disabled: busy || acknowledged !== true'))
+check('the selection is cleared after a batch', source.includes('clearSelection()'))
+// A group ticked as a whole disables its own item boxes: otherwise unchecking a
+// file inside it would look like an exclusion while the group is still sent.
+check('a whole-selected group disables its item boxes',
+  source.includes('disabled: busy || groupSelected,'))
+
+console.log('# recycle-bin role labels')
+check('a group says how much of it is conversation files', source.includes("t('trash.roles')"))
+check('a group says when the conversation itself is in it', source.includes("t('trash.conversationGone')"))
+check('a files-only group says the conversation was kept', source.includes("t('trash.filesOnly')"))
+check('a file row names the conversation it came from', source.includes("t('trash.producedBy')"))
+check('the roles come from the group row, not from the item kinds',
+  source.includes('const roles = group.roles ?? { record: 0, file: 0 }'))
+check('the restore reports where the conversation went',
+  source.includes("t('trash.workspaceReattached')") && source.includes("t('trash.workspaceCreated')"))
+check('the restore explains an ungrouped conversation',
+  source.includes("t('trash.workspaceUngrouped')"))
+check('the restore mentions subagent conversations', source.includes("t('trash.workspaceSubagent')"))
 
 console.log('# safety rails')
-check('the dialog sends ids, never paths', /artifactIds: artifactIds \?\? \[\]/.test(source) && /referencedIds,/.test(source))
+check('the dialog sends ids, never paths',
+  /artifactIds: \[\.\.\.\(artifactIds \?\? \[\]\), \.\.\.outsideIds\],/.test(source)
+  && /changedIds,/.test(source))
+// The request must not carry a field the Host now refuses: sending an empty
+// `referencedIds` would read as "the caller has a referenced selection", which
+// is exactly the state 1.4.0 removed.
+check('the request carries no referenced ids at all',
+  !/referencedIds:/.test(source))
 check('a delete in flight is gated by a ref, not only by state',
   (source.match(/inFlight\.current/g) ?? []).length >= 6)
 check('the overflow refusal is read from the response code', source.includes("error?.code === 'trash-overflow'"))

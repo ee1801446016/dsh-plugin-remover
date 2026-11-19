@@ -20,6 +20,9 @@ import { join } from 'node:path'
 
 const base = process.env.DSH_WEB_URL
 
+/** The version this checkout ships; the running Host is compared against it. */
+const LOCAL_VERSION = JSON.parse(readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8')).version
+
 /**
  * Read this package's manifest and the two exported resources.
  *
@@ -162,7 +165,10 @@ async function main() {
   console.log('# package metadata')
   const manifest = inspectManifest()
   equal('the package is the renamed one', manifest.name, 'dsh-plugin-remover')
-  equal('the version is the first release of the new package', manifest.version, '1.0.0')
+  // Read the expected version instead of pinning it here: a version bump is a
+  // release decision, not a served-bundle regression, and hardcoding it turned
+  // every bump into a red suite that said nothing about the running Host.
+  equal('the installed revision matches package.json', manifest.version, LOCAL_VERSION)
   // The regression guard for the ENOENT this suite was extended after: without
   // these two exports the Host cannot read the plugin's own display metadata.
   equal('it exports its locale dictionaries', manifest.localeExport, './locale/*.json')
@@ -193,7 +199,7 @@ async function main() {
   }
   check('the plugin answers health', health.status === 200)
   check('the plugin reports itself', health.body.includes('"plugin":"dsh-plugin-remover"'))
-  check('the Host half is the installed revision', health.body.includes('"version":"1.0.0"'))
+  check('the Host half is the installed revision', health.body.includes(`"version":"${LOCAL_VERSION}"`))
 
   console.log('# client bundle')
   const entry = await graphEntry('dsh-plugin-remover')
@@ -233,6 +239,23 @@ async function main() {
   check('the served bundle carries the dialog stylesheet', bundle.body.includes('dsh-plugin-remover-styles'))
   check('the served bundle caps the dialog height', bundle.body.includes('max-height: calc(100vh - 48px)'))
   check('the served bundle scrolls the dialog body', bundle.body.includes('overflow-y: auto'))
+  // 1.2.0: the compact sectioned dialog, the keep-the-conversation switch, and
+  // the batch recycle bin. Each is a served artifact the browser must actually
+  // receive, not just a source file that has it.
+  check('the served bundle folds the sections', bundle.body.includes('section-head'))
+  check('the served bundle keeps the conversation switch', bundle.body.includes('includeRecord'))
+  check('the served bundle labels recycle-bin roles', bundle.body.includes("trash.roles"))
+  check('the served bundle marks files-only groups', bundle.body.includes("trash.filesOnly"))
+  check('the served bundle supports a batch restore', bundle.body.includes("trash.restoreSelection"))
+  check('the served bundle supports a batch delete', bundle.body.includes("trash.deleteSelection"))
+  // 1.3.0: files outside the working directory, the attachment-copy fold, and the
+  // refused-row list. All three are browser-side features, so a Host-only upgrade
+  // would leave them invisible while every offline Host check stayed green.
+  check('the served bundle has the outside-the-workspace section', bundle.body.includes('section.outside'))
+  check('the served bundle folds a duplicated attachment', bundle.body.includes('mirrorOf'))
+  check('the served bundle names the store copy in the file details', bundle.body.includes('detail.mirror'))
+  check('the served bundle lists refused rows with their reason', bundle.body.includes('refusedList'))
+  check('the served bundle reports the copies it took', bundle.body.includes('done.mirrors'))
 
   console.log('# routes')
   const trash = await post('/trash/list', {})
@@ -242,6 +265,12 @@ async function main() {
   check('the list reports groups', Array.isArray(trash.payload?.groups))
   check('the list reports the retention cap', typeof trash.payload?.maxBytes, 'number')
   check('the list reports the sidebar-entry switch', typeof trash.payload?.settings?.showSidebarTrash, 'boolean')
+  // 1.3.0 routes surface: a group row carries whether its files all came from
+  // outside the working directory, and whether the group is an unfinished delete.
+  check('the list marks unfinished groups',
+    (trash.payload?.groups ?? []).every(row => typeof row.recovery === 'boolean'))
+  check('the list marks outside-only groups',
+    (trash.payload?.groups ?? []).every(row => typeof row.outsideOnly === 'boolean'))
 
   // The switch is a patch: flipping it must leave the two numeric settings as
   // they were. It is restored afterwards so the suite does not leave the user's
@@ -277,6 +306,11 @@ async function main() {
     check('the scan reports a children list', Array.isArray(scan.payload?.children))
     check('the scan reports produced files', Array.isArray(scan.payload?.artifacts?.items))
     check('the scan reports referenced files', Array.isArray(scan.payload?.referenced?.items))
+    // The contract a stale page depends on: whatever this Host reports as
+    // referenced cannot be deleted, and it says so instead of leaving the reader
+    // to discover it by watching nothing happen.
+    check('the scan marks referenced files non-deletable',
+      scan.payload?.referenced?.deletable === false)
     const firstFile = scan.payload?.artifacts?.items?.[0] ?? scan.payload?.referenced?.items?.[0]
     if (firstFile !== undefined) {
       check('a file row carries its source directory', typeof firstFile.dir === 'string' && firstFile.dir !== '')

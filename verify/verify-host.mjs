@@ -23,6 +23,7 @@
  */
 
 import { strict as assert } from 'node:assert'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile, utimes } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -216,6 +217,17 @@ function fakeContext() {
   const emitted = []
   const services = new Map()
   services.set('sessionPersistence', fakePersistence())
+  // Every route the plugin registers, so the tests can drive the real HTTP
+  // surface instead of calling buildPlan directly. A field the route forgets to
+  // forward is invisible to a unit test and invisible in the UI at the same
+  // time — which is exactly how the `changed` group shipped broken.
+  const routes = new Map()
+  services.set('webServer', {
+    register(spec) {
+      routes.set(spec.path, spec)
+      return () => { routes.delete(spec.path) }
+    },
+  })
   const interruptions = []
   services.set('subagents', {
     interrupt(sessionId, options) {
@@ -223,14 +235,79 @@ function fakeContext() {
     },
   })
   const archived = []
-  services.set('workspaceRegistry', {
+  const attached = []
+  const unarchived = []
+  const created = []
+  // A mutable Workspace registry stub. The plugin talks to this interface in two
+  // places: `buildPlan` reads `list()` to record which workspace a conversation
+  // belongs to, and a restore re-attaches/unarchives/creates. Both need to be
+  // observable, or the restore path could silently do nothing and still pass.
+  const workspaces = []
+  const workspaceRegistry = {
     list() {
-      return []
+      return workspaces
+    },
+    get(id) {
+      return workspaces.find(row => row.id === id)
+    },
+    async resolveByPath(path) {
+      let canonical
+      try {
+        canonical = realpathSync(path)
+      } catch {
+        return undefined
+      }
+      return workspaces.find(row => internals.samePath(row.path, canonical))
+    },
+    async create(path, title) {
+      const row = {
+        id: `workspace-made-${String(workspaces.length + 1)}`,
+        path,
+        title: title ?? 'made',
+        sessionIds: [],
+        async attachSession(sessionId) {
+          this.sessionIds.push(sessionId)
+          attached.push({ workspaceId: this.id, sessionId })
+        },
+        async detachSession(sessionId) {
+          this.sessionIds = this.sessionIds.filter(id => id !== sessionId)
+        },
+      }
+      workspaces.push(row)
+      created.push({ path, title })
+      return row
     },
     async archiveSession(sessionId, options) {
       archived.push({ sessionId, options })
     },
-  })
+    async unarchiveSession(sessionId) {
+      unarchived.push(sessionId)
+    },
+  }
+  /**
+   * Add one already-existing workspace whose directory is `path`.
+   * @param path - existing directory.
+   * @param title - display title.
+   * @returns the added row.
+   */
+  const addWorkspace = (path, title) => {
+    const row = {
+      id: `workspace-${String(workspaces.length + 1)}`,
+      path,
+      title,
+      sessionIds: [],
+      async attachSession(sessionId) {
+        this.sessionIds.push(sessionId)
+        attached.push({ workspaceId: this.id, sessionId })
+      },
+      async detachSession(sessionId) {
+        this.sessionIds = this.sessionIds.filter(id => id !== sessionId)
+      },
+    }
+    workspaces.push(row)
+    return row
+  }
+  services.set('workspaceRegistry', workspaceRegistry)
   // Sessions this process considers open; `isLive` reads this map.
   const live = new Set()
   services.set('sessions', {
@@ -242,7 +319,21 @@ function fakeContext() {
     emitted,
     interruptions,
     archived,
+    attached,
+    unarchived,
+    created,
+    workspaces,
+    addWorkspace,
     live,
+    routes,
+    // `apply` reads the web server off the context property, not through `get`.
+    webServer: services.get('webServer'),
+    // `apply` registers routes inside ctx.effect callbacks; without this the
+    // route layer cannot be mounted at all.
+    effect(fn) {
+      const dispose = fn()
+      return () => { if (typeof dispose === 'function') dispose() }
+    },
     sessionPersistence: services.get('sessionPersistence'),
     get(name) {
       return services.get(name)
@@ -303,9 +394,16 @@ await group('classification', async () => {
   const { allowed, refused } = await internals.classifyItems(paths, [WORKSPACE_REAL], HOME, 'artifact')
   const allowedPaths = allowed.map(row => row.path)
   check('a produced file is allowed', allowedPaths.includes(realpathSync(files.produced)))
-  check('a file outside the working directory is refused', !allowedPaths.includes(realpathSync(files.outside)))
-  const reason = refused.find(row => row.path === files.outside)?.reason
-  equal('the refusal names the working-directory rule', reason, '不在该对话的工作目录内，已跳过')
+  // Since 1.3.0 a file outside the working directory is listed, but marked as
+  // outside so the dialog can keep it collapsed and unticked. It used to be
+  // refused outright, which made a file the conversation genuinely read in
+  // another directory impossible to delete from this dialog at all.
+  check('a file outside the working directory is allowed', allowedPaths.includes(realpathSync(files.outside)))
+  equal('it is marked as outside the working directory',
+    allowed.find(row => row.path === realpathSync(files.outside))?.scope, 'outside')
+  equal('a file inside is marked as inside',
+    allowed.find(row => row.path === realpathSync(files.produced))?.scope, 'inside')
+  equal('nothing is refused on the working-directory rule alone', refused.length, 0)
   const row = allowed.find(item => item.path === realpathSync(files.produced))
   equal('the row reports its source directory', row.dir, realpathSync(dirname(files.produced)))
   equal('the row reports its byte size', row.bytes, statSync(files.produced).size)
@@ -358,7 +456,14 @@ await group('plan selection', () => {
   const read = plan.referenced.items.map(row => row.path)
   check('the read-only file is in `referenced`', read.includes(realpathSync(files.readOnly)))
   check('a written file is not also listed as read', !read.includes(realpathSync(files.produced)))
-  check('a read file outside the working directory is refused', !read.includes(realpathSync(files.outside)))
+  // Referenced files are one flat list now, because none of them is deletable:
+  // the working directory a read file sat under no longer changes anything the
+  // reader can do, so splitting the list would only imply a decision exists.
+  equal('the referenced group is explicitly marked non-deletable', plan.referenced.deletable, false)
+  check('a read file outside the working directory is listed in the same group',
+    read.includes(realpathSync(files.outside)))
+  equal('there is no separate outside list for read files', plan.referenced.outside, undefined)
+  check('the byte total covers both', plan.referenced.totalBytes >= statSync(files.outside).size)
   equal('the two attachments are reported', plan.attachments.ids.length, 2)
   equal('the projection cache is found', plan.projectionCache.exists, true)
 })
@@ -393,7 +498,6 @@ const first = await internals.purge(ctx, {
   sessionId: SESSIONS.parent,
   include: { record: true, cache: true, children: true, attachments: true },
   artifactIds,
-  referencedIds: [],
   childIds: [SESSIONS.childA, SESSIONS.childB],
 })
 
@@ -403,7 +507,10 @@ await group('purge result', () => {
   equal('the recorded directories are reported', first.removed.directories.length, 3)
   equal('both children are reported', first.removed.children.length, 2)
   equal('one produced file is reported', first.removed.artifacts.length, 1)
-  equal('no referenced file is reported', first.removed.referenced.length, 0)
+  // There is no counter for them at all now: a referenced file cannot enter the
+  // deletion, so a field recording how many did would be a field that is always
+  // zero and never means anything.
+  equal('no referenced counter exists on the result', first.removed.referenced, undefined)
   check('the projection cache is reported', first.removed.projectionCache !== null)
   equal('there are no errors', first.errors.length, 0)
 })
@@ -661,10 +768,13 @@ await group('cross-volume copy', async () => {
 })
 
 await group('referenced selection', async () => {
-  // Deleting a file the conversation merely read is opt-in, one id at a time.
-  const readPlan = await internals.buildPlan(ctx, SESSIONS.other)
-  void readPlan
-  // Re-seed a parent with a readable file, so the selection can be asserted.
+  // Referenced files are listed for context and never deleted. The rule exists
+  // because the log cannot tell a file the conversation generated and re-read
+  // from one that was already on disk: both produce the same `read` call, so a
+  // delete control on the second kind would occasionally destroy the user's
+  // work. What still has to hold is that asking for one is refused by name —
+  // a page from 1.3.0 sends these ids, and answering "done" while leaving the
+  // file alone is precisely the silent lie this plugin exists to remove.
   mkdirSync(join(HOME, 'sessions', PROJECT, 'session-ref-0006'), { recursive: true })
   writeFileSync(join(HOME, 'sessions', PROJECT, 'session-ref-0006', 'session.v4.jsonl.zstd'), 'ref\n', 'utf8')
   headers['session-ref-0006'] = { version: 4, id: 'session-ref-0006', createdAt: 1700, cwd: WORKSPACE }
@@ -674,48 +784,78 @@ await group('referenced selection', async () => {
   const planRef = await internals.buildPlan(ctx, 'session-ref-0006')
   equal('the read file is reported as referenced', planRef.referenced.items.length, 1)
   equal('nothing is reported as produced', planRef.artifacts.items.length, 0)
+  equal('the group says it is not deletable', planRef.referenced.deletable, false)
   const readId = planRef.referenced.items[0].id
 
-  // Unticked: the file must not be touched.
+  // Not asking: the file must not be touched, and the conversation still goes.
   const untouched = await internals.purge(ctx, {
     sessionId: 'session-ref-0006',
     include: { record: true, cache: true, children: true, attachments: false },
     artifactIds: [],
-    referencedIds: [],
   })
-  equal('a purge with no referenced ids succeeds', untouched.ok, true)
+  equal('a purge that does not name them succeeds', untouched.ok, true)
   check('the read file is untouched', existsSync(files.readOnly))
-  equal('and no referenced file is reported', untouched.removed.referenced.length, 0)
+  equal('the result has no referenced counter', untouched.removed.referenced, undefined)
 
-  // Ticked: it moves into the group.
+  // Asking: refused, and nothing moves.
   mkdirSync(join(HOME, 'sessions', PROJECT, 'session-ref-0007'), { recursive: true })
   writeFileSync(join(HOME, 'sessions', PROJECT, 'session-ref-0007', 'session.v4.jsonl.zstd'), 'ref\n', 'utf8')
   headers['session-ref-0007'] = { version: 4, id: 'session-ref-0007', createdAt: 1800, cwd: WORKSPACE }
   events['session-ref-0007'] = [readCall(files.readOnly)]
   refreshStored()
   const planRef2 = await internals.buildPlan(ctx, 'session-ref-0007')
-  const moved = await internals.purge(ctx, {
+  equal('the id is stable across plans', planRef2.referenced.items[0].id, readId)
+
+  const asked = await internals.purge(ctx, {
     sessionId: 'session-ref-0007',
     include: { record: true, cache: true, children: true, attachments: false },
     artifactIds: [],
-    referencedIds: [planRef2.referenced.items[0].id],
+    referencedIds: [readId],
   })
-  equal('the ticked referenced file is removed', moved.removed.referenced.length, 1)
-  check('it left its directory', !existsSync(files.readOnly))
-  equal('the id it was addressed by is the plan id', planRef2.referenced.items[0].id, readId)
+  equal('asking to delete a referenced file is refused', asked.ok, false)
+  equal('the refusal names the reason', asked.code, 'referenced-not-deletable')
+  equal('it counts what was asked for', asked.referencedRequested, 1)
+  equal('and what the fresh plan still recognises', asked.referencedRecognised, 1)
+  check('the refusal explains itself in words', typeof asked.error === 'string' && asked.error.length > 0)
+  check('the read file is still there', existsSync(files.readOnly))
+  equal('the read file is byte-identical', fingerprint(files.readOnly).bytes, before.readOnly.bytes)
+  check('the conversation was not touched either', existsSync(join(HOME, 'sessions', PROJECT, 'session-ref-0007')))
 })
 
 await group('stale id', async () => {
   // An id the Host did not produce resolves to nothing: the selection is a
-  // filter over a freshly rebuilt plan, not a list of paths to trust.
+  // filter over a freshly rebuilt plan, not a list of paths to trust. That used
+  // to be reported as success with nothing moved, which reads exactly like a
+  // completed deletion in the dialog; naming something that matched nothing is
+  // now a refusal with a reason.
   const other = await internals.purge(ctx, {
     sessionId: 'session-ref-0007',
     include: { record: false, cache: false, children: false, attachments: false },
     artifactIds: ['adeadbeefcafe'],
+  })
+  equal('a purge with only stale ids is refused', other.ok, false)
+  equal('the refusal says nothing matched', other.code, 'nothing-matched')
+  equal('and removes nothing', other.removed.artifacts.length, 0)
+  // A request that genuinely ticked nothing is still a harmless no-op, because
+  // the dialog can leave that state on screen without the user doing anything.
+  const untouched = await internals.purge(ctx, {
+    sessionId: 'session-ref-0007',
+    include: { record: false, cache: false, children: false, attachments: false },
+    artifactIds: [],
+  })
+  equal('ticking nothing is still a no-op', untouched.ok, true)
+  equal('and it is marked empty', untouched.empty, true)
+  // A stale *referenced* id is refused by the rule that owns it rather than as a
+  // generic miss: the caller asked to delete a referenced file, and that is the
+  // fact worth reporting back.
+  const staleReference = await internals.purge(ctx, {
+    sessionId: 'session-ref-0007',
+    include: { record: false, cache: false, children: false, attachments: false },
+    artifactIds: [],
     referencedIds: ['ffffffffffff'],
   })
-  equal('a purge with only stale ids still succeeds', other.ok, true)
-  equal('and removes nothing', other.removed.artifacts.length, 0)
+  equal('a stale referenced id is refused by the referenced rule', staleReference.code, 'referenced-not-deletable')
+  equal('and it recognises none of them', staleReference.referencedRecognised, 0)
 })
 
 // ---------------------------------------------------------------------------
@@ -755,6 +895,131 @@ await group('symlink escape', async () => {
   const { allowed, refused } = await internals.classifyItems(paths, [WORKSPACE_REAL], HOME, 'artifact')
   equal('a symlink out of the working directory is refused', allowed.length, 0)
   equal('and it is reported', refused.length, 1)
+})
+
+await group('a refused path says why', async () => {
+  // The three refusals that matter, each provoked for real. A count without a
+  // reason is what made "the file is not on the list" indistinguishable from a
+  // bug; every one of these rows carries a sentence a reader can act on.
+  const missing = join(WORKSPACE, 'gone.txt')
+  const dshOwned = join(HOME, 'attachments', 'v1', 'objects', 'zz', 'owned.txt')
+  mkdirSync(dirname(dshOwned), { recursive: true })
+  writeFileSync(dshOwned, 'plugin data', 'utf8')
+  const paths = new Map([
+    [missing, { ops: 1, tools: new Set(['write']), sources: new Map() }],
+    [dshOwned, { ops: 1, tools: new Set(['write']), sources: new Map() }],
+  ])
+  const { allowed, refused } = await internals.classifyItems(paths, [WORKSPACE_REAL], HOME, 'artifact')
+  equal('neither refused path is allowed', allowed.length, 0)
+  equal('a missing file says it is missing', refused.find(row => row.path === missing)?.reason, '文件已不存在')
+  equal('a DSH-owned file says where it lives', refused.find(row => row.path === dshOwned)?.reason, '位于 DSH 数据目录内，已跳过')
+})
+
+await group('an operating-system directory is never deletable', async () => {
+  // A conversation can name any path, and since 1.3.0 naming one outside the
+  // working directory is enough to make it deletable. The OS tree is the one
+  // boundary that has to be explicit: an `edit` call against the Windows
+  // directory in a log is a mistaken path, not an instruction.
+  const roots = internals.blockedRoots()
+  check('some system roots are known on this platform', roots.length > 0)
+  check('the Windows directory is among them',
+    process.platform !== 'win32' || roots.some(root => /windows/i.test(root)))
+  const windowsFile = process.platform === 'win32'
+    ? join(process.env.SystemRoot ?? 'C:\\Windows', 'system.ini')
+    : '/etc/hostname'
+  check('a path inside it is blocked', internals.blockingRootOf(windowsFile) !== null)
+  check('a path under the temporary directory is not blocked',
+    internals.blockingRootOf(join(ROOT, 'workspace', 'out.txt')) === null)
+  // Case and separator folding, because a log can name the same directory either way.
+  check('the block is case-insensitive', internals.insideFolded('C:\\Windows', 'c:/windows/system32/x.dll'))
+  check('the block does not match a sibling', !internals.insideFolded('C:\\Windows', 'C:\\Windows.old\\x.dll'))
+})
+
+await group('an attachment copy is recognised by its bytes', async () => {
+  const payload = 'the-same-bytes-everywhere'
+  const file = join(WORKSPACE, 'mirror-source.png')
+  writeFileSync(file, payload, 'utf8')
+  const digest = createHash('sha256').update(payload).digest('hex')
+  const object = join(HOME, 'attachments', 'v1', 'objects', digest.slice(0, 2), digest)
+  mkdirSync(dirname(object), { recursive: true })
+  writeFileSync(object, payload, 'utf8')
+
+  equal('the digest matches the file', await internals.hashFile(file), digest)
+  const rows = [{ path: file, bytes: statSync(file).size }]
+  const attachments = [{ id: `sha256:${digest}`, bytes: statSync(file).size }]
+  const mirrors = await internals.findAttachmentMirrors(rows, attachments, HOME)
+  equal('the copy is found', mirrors.length, 1)
+  equal('it points at the file that holds the same bytes', mirrors[0].path, file)
+  equal('and at the attachment id', mirrors[0].attachmentId, `sha256:${digest}`)
+
+  // A different size cannot be the same bytes, and a different digest cannot either.
+  const wrongSize = await internals.findAttachmentMirrors([{ path: file, bytes: 1 }], attachments, HOME)
+  equal('a differing byte count is not a match', wrongSize.length, 0)
+  const otherPayload = 'different-bytes-entirely'
+  const otherFile = join(WORKSPACE, 'other.png')
+  writeFileSync(otherFile, otherPayload, 'utf8')
+  const sameSize = Buffer.byteLength(otherPayload) === Buffer.byteLength(payload)
+  const wrongBytes = await internals.findAttachmentMirrors(
+    [{ path: otherFile, bytes: Buffer.byteLength(otherPayload) }],
+    sameSize ? attachments : [{ ...attachments[0], bytes: Buffer.byteLength(otherPayload) }],
+    HOME,
+  )
+  equal('an equal byte count alone is not a match', wrongBytes.length, 0)
+})
+
+await group('a failed publish puts everything back', async () => {
+  // The dangerous case: every item moved into `<key>.partial`, then the final
+  // rename fails — on Windows that is what happens while the Harness holds the
+  // Session log open. Letting the error escape would strand the files: gone from
+  // their directories, invisible to the bin, never swept.
+  mkdirSync(join(HOME, 'sessions', PROJECT, 'session-publish-0008'), { recursive: true })
+  writeFileSync(join(HOME, 'sessions', PROJECT, 'session-publish-0008', 'session.v4.jsonl.zstd'), 'publish\n', 'utf8')
+  headers['session-publish-0008'] = { version: 4, id: 'session-publish-0008', createdAt: 1900, cwd: WORKSPACE }
+  const original = join(WORKSPACE, 'publish-target.txt')
+  mkdirSync(dirname(original), { recursive: true })
+  writeFileSync(original, 'publish me', 'utf8')
+  events['session-publish-0008'] = [writeCall('write', original)]
+  refreshStored()
+
+  const planPublish = await internals.buildPlan(ctx, 'session-publish-0008')
+  equal('the file is in the plan', planPublish.artifacts.items.length, 1)
+  const failed = await internals.purge(ctx, {
+    sessionId: 'session-publish-0008',
+    include: { record: true, cache: true, children: false, attachments: false },
+    artifactIds: planPublish.artifacts.items.map(row => row.id),
+    referencedIds: [],
+    // The seam that makes the publish throw, exactly as a busy handle does.
+    publish: async () => { throw new Error('EPERM: simulated busy handle') },
+  })
+  equal('a failed publish is not reported as success', failed.ok, false)
+  equal('the refusal names the stage', failed.code, 'publish-failed')
+  check('it reports how much was rolled back', failed.rolledBack >= 1)
+  check('the file is back in its directory', existsSync(original))
+  equal('and its bytes are intact', readFileSync(original, 'utf8'), 'publish me')
+  check('the Session log is back too', existsSync(join(HOME, 'sessions', PROJECT, 'session-publish-0008')))
+  // Nothing may be left in a hidden partial when every item made it back.
+  const leftovers = await internals.listManifests(HOME)
+  equal('nothing is left in an unfinished group', leftovers.filter(row => row.recovery === true).length, 0)
+})
+
+await group('sweep leaves an unfinished deletion alone', async () => {
+  // Retention must never delete the only record of where those files came from.
+  const key = internals.newGroupKey('session-sweep-test')
+  const partial = join(internals.trashGroups(HOME), `${key}.partial`)
+  mkdirSync(join(partial, 'artifacts', '0'), { recursive: true })
+  writeFileSync(join(partial, 'artifacts', '0', 'x.txt'), 'x', 'utf8')
+  writeFileSync(join(partial, 'manifest.json'), JSON.stringify({
+    formatVersion: 1,
+    groupKey: key,
+    sessionId: 'session-sweep-test',
+    deletedAt: 1,
+    bytes: 1,
+    items: [{ path: 'artifacts/0/x.txt', kind: 'artifact', role: 'file', originalPath: join(WORKSPACE, 'x.txt'), bytes: 1, sessionId: 'session-sweep-test' }],
+  }), 'utf8')
+  const swept = await internals.sweepTrash(HOME, true)
+  check('the sweep does not drop it', !swept.removed.some(row => row.groupKey === `${key}.partial`))
+  check('it is still on disk', existsSync(partial))
+  rmSync(partial, { recursive: true, force: true })
 })
 
 await group('degraded persistence', async () => {
@@ -896,6 +1161,357 @@ await group('storage accounting', async () => {
     check('a group row carries its items when asked', Array.isArray(row.items))
     check('each item row reports a source directory', row.items.every(item => typeof item.dir === 'string'))
   }
+})
+
+// ---------------------------------------------------------------------------
+// The HTTP surface.
+//
+// Everything above drives buildPlan directly, which is a blind spot: a field
+// buildPlan computes but the `/scan` route forgets to forward is invisible here
+// and invisible in the dialog at the same time. The `changed` group shipped in
+// exactly that state — computed, tested, and never sent.
+
+await group('the routes are registered', async () => {
+  const { apply } = await import('../lib/index.js')
+  apply(ctx)
+  check('the scan route is mounted', ctx.routes.has('/plugins/dsh-plugin-remover/api/scan'))
+  check('the health route is mounted', ctx.routes.has('/plugins/dsh-plugin-remover/api/health'))
+  check('the purge route is mounted', ctx.routes.has('/plugins/dsh-plugin-remover/api/purge'))
+})
+
+/**
+ * Drive one registered route and return the parsed JSON body.
+ *
+ * The route wrapper is deliberately fire-and-forget (`void (async () => ...)()`),
+ * so awaiting the handler returns before the response is written. Wait on the
+ * response itself instead — the same way the web server does.
+ */
+async function callRoute(path, body) {
+  const route = ctx.routes.get(path)
+  if (route === undefined) throw new Error(`no route ${path}`)
+  const req = {
+    method: 'POST',
+    headers: { 'x-dsh-plugin-remover': '1' },
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify(body ?? {}), 'utf8')
+    },
+  }
+  const done = Promise.withResolvers()
+  const res = {
+    headersSent: false,
+    status: null,
+    setHeader() {},
+    writeHead(status) {
+      this.status = status
+      this.headersSent = true
+    },
+    end(text) {
+      done.resolve(text === undefined ? null : JSON.parse(String(text)))
+    },
+  }
+  route.handler(req, res)
+  const payload = await done.promise
+  return { status: res.status, payload }
+}
+
+await group('the scan route forwards every group it computes', async () => {
+  const { payload } = await callRoute('/plugins/dsh-plugin-remover/api/scan', { sessionId: SESSIONS.parent })
+  check('the route answers', payload !== null && payload.ok === true)
+  for (const key of ['artifacts', 'referenced', 'changed', 'attachments', 'store', 'children', 'projectionCache', 'trash']) {
+    check(`the response carries ${key}`, payload[key] !== undefined)
+  }
+  // The specific regression: the group must carry its shape, not just exist.
+  check('the changed group carries an item list', Array.isArray(payload.changed.items))
+  check('the changed group carries a byte total', typeof payload.changed.totalBytes === 'number')
+  check('the changed group carries a truncation flag', typeof payload.changed.truncated === 'boolean')
+  check('the changed group declares a window slot', 'window' in payload.changed)
+  // And it must agree with what buildPlan computed, not be an empty stub.
+  const direct = await internals.buildPlan(ctx, SESSIONS.parent)
+  equal('the route forwards the same item count buildPlan computed',
+    payload.changed.items.length, direct.changed.items.length)
+})
+
+// ---------------------------------------------------------------------------
+// Keeping the conversation while deleting its files
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed one extra Session with a working directory of its own.
+ *
+ * The groups above destroyed most of the original fixture, and these checks need
+ * a conversation that is still there to keep. Seeding a fresh one also proves
+ * the keep-the-conversation path starts from a healthy plan rather than from a
+ * half-deleted leftover.
+ *
+ * @param id - Session id.
+ * @param cwd - working directory its header records.
+ * @param produced - absolute path one `write` call names.
+ * @returns the Session id.
+ */
+function seedExtra(id, cwd, produced) {
+  headers[id] = { version: 4, id, createdAt: 2000, cwd, isSeeded: false }
+  events[id] = [writeCall('write', produced)]
+  mkdirSync(join(HOME, 'sessions', PROJECT, id), { recursive: true })
+  const line = {
+    type: 'session', version: 4, id, createdAt: 2000, isSeeded: false, delegationDepth: 0, cwd,
+  }
+  writeFileSync(join(HOME, 'sessions', PROJECT, id, 'session.v4.jsonl.zstd'), Buffer.concat([
+    zstdCompressSync(Buffer.from(`${JSON.stringify(line)}\n`, 'utf8')),
+    zstdCompressSync(Buffer.from(`${JSON.stringify({ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } })}\n`, 'utf8')),
+  ]))
+  const cacheFile = join(HOME, 'storages', 'session_projcache', 'sessions', `${id}.json`)
+  mkdirSync(dirname(cacheFile), { recursive: true })
+  writeFileSync(cacheFile, `${JSON.stringify({ record: { rows: { title: { val: `title-${id}` } } } })}\n`, 'utf8')
+  refreshStored()
+  return id
+}
+
+const KEEP_DIR = join(ROOT, 'keep-workspace')
+mkdirSync(KEEP_DIR, { recursive: true })
+const keepFile = join(KEEP_DIR, 'kept-output.txt')
+writeFileSync(keepFile, 'produced while the conversation is kept\n', 'utf8')
+const KEEP = seedExtra('session-keep-6666', KEEP_DIR, keepFile)
+const keepWorkspace = ctx.addWorkspace(realpathSync(KEEP_DIR), 'keep')
+
+await group('a conversation can be kept while its files are deleted', async () => {
+  const scan = await internals.buildPlan(ctx, KEEP)
+  equal('the plan finds the produced file', scan.artifacts.items.length, 1)
+  equal('the plan records the owning workspace', scan.workspace?.id, keepWorkspace.id)
+
+  const emittedBefore = ctx.emitted.length
+  const kept = await internals.purge(ctx, {
+    sessionId: KEEP,
+    include: { record: false, cache: false, children: false, attachments: true },
+    artifactIds: scan.artifacts.items.map(row => row.id),
+  })
+
+  equal('the purge succeeds', kept.ok, true)
+  check('it went into the recycle bin', typeof kept.trash?.groupKey === 'string')
+  equal('the produced file left its directory', existsSync(keepFile), false)
+  check('the conversation log is still there', existsSync(join(HOME, 'sessions', PROJECT, KEEP)))
+  check('the projection cache is still there',
+    existsSync(join(HOME, 'storages', 'session_projcache', 'sessions', `${KEEP}.json`)))
+  equal('no directory is reported as removed', kept.removed.directories.length, 0)
+  // A kept conversation must not be archived, detached, or dropped from the page:
+  // all three would hide a conversation that still exists.
+  equal('a kept conversation is not archived', ctx.archived.filter(row => row.sessionId === KEEP).length, 0)
+  equal('a kept conversation is not detached', kept.removed.detached.length, 0)
+  equal('no removal event is emitted for a kept conversation',
+    ctx.emitted.slice(emittedBefore).filter(row => row.name === 'api-session/removed').length, 0)
+
+  const manifest = JSON.parse(readFileSync(
+    join(internals.trashGroups(HOME), kept.trash.groupKey, 'manifest.json'), 'utf8'))
+  equal('the manifest says the conversation was kept', manifest.recordIncluded, false)
+  check('the manifest records no conversation file', manifest.items.every(item => item.role !== 'record'))
+  check('the manifest records the file as a file', manifest.items.some(item => item.role === 'file'))
+  // The restore has to know this group holds no conversation to hand back.
+  const group = internals.groupRow(manifest, { retentionDays: 30, maxBytes: 0 }, true)
+  equal('the group row says the conversation was kept', group.recordIncluded, false)
+  equal('the group row counts its files', group.fileCount, 1)
+  equal('the group row counts no conversation items', group.roles.record, 0)
+  check('each item row carries its role', group.items.every(item => item.role === 'file'))
+  equal('the group row keeps the workspace it was deleted from',
+    group.workspace?.id, keepWorkspace.id)
+})
+
+await group('attachments are forced off when the conversation is kept', () => {
+  const kept = internals.selectionOf({ include: { record: false, attachments: true } })
+  equal('attachments cannot be deleted with a kept conversation', kept.attachments, false)
+  equal('the forcing is reported so the dialog can explain it', kept.attachmentsForcedOff, true)
+  const both = internals.selectionOf({ include: { record: true, attachments: false } })
+  equal('an explicit opt-out is still an opt-out', both.attachments, false)
+  equal('an explicit opt-out is not reported as forced', both.attachmentsForcedOff, false)
+  const plain = internals.selectionOf({})
+  equal('the default still takes the record', plain.record, true)
+  equal('the default still takes attachments', plain.attachments, true)
+})
+
+// ---------------------------------------------------------------------------
+// Restoring a conversation to its workspace
+// ---------------------------------------------------------------------------
+
+await group('a restore re-attaches the conversation to its workspace', async () => {
+  const scan = await internals.buildPlan(ctx, KEEP)
+  // Nothing is left to delete for this conversation, so delete the record to
+  // give the restore something to put back.
+  const purge = await internals.purge(ctx, {
+    sessionId: KEEP,
+    include: { record: true, cache: true, children: false, attachments: false },
+  })
+  equal('the purge succeeds', purge.ok, true)
+  const groupKey = purge.trash.groupKey
+  check('the conversation log left', !existsSync(join(HOME, 'sessions', PROJECT, KEEP)))
+  const manifest = JSON.parse(readFileSync(join(internals.trashGroups(HOME), groupKey, 'manifest.json'), 'utf8'))
+  equal('the manifest says the conversation went', manifest.recordIncluded, true)
+  check('the manifest records the workspace', manifest.workspace?.id === keepWorkspace.id)
+
+  const before = { attached: ctx.attached.length, unarchived: ctx.unarchived.length, created: ctx.created.length }
+  const restored = await internals.restoreGroups(ctx, HOME, { groupKey })
+  equal('nothing failed', restored.failed.length, 0)
+  equal('one group is reported', restored.groups.length, 1)
+  equal('the group is dropped once empty', restored.groups[0].groupRemoved, true)
+  equal('the group is marked restored whole', restored.groups[0].sessionId, KEEP)
+  check('the conversation log is back', existsSync(join(HOME, 'sessions', PROJECT, KEEP)))
+  // Re-attaching only works after the log is on disk, so this also proves the order.
+  equal('it is attached to the workspace again', ctx.attached.length, before.attached + 1)
+  equal('it is attached to the workspace it was deleted from', ctx.attached.at(-1)?.workspaceId, keepWorkspace.id)
+  equal('it is taken out of the archive set', ctx.unarchived.length, before.unarchived + 1)
+  equal('no workspace had to be recreated', ctx.created.length, before.created)
+  const session = restored.groups[0].sessions[0]
+  equal('the restore reports where it went', session.workspace.status, 're-attached')
+  equal('the restore names the workspace', session.workspace.workspaceId, keepWorkspace.id)
+})
+
+await group('a restore recreates a workspace whose record is gone', async () => {
+  // Same directory, but the registration was deleted: the conversation must land
+  // in a workspace for that directory rather than in Ungrouped.
+  const gone = ctx.workspaces.findIndex(row => row.id === keepWorkspace.id)
+  ctx.workspaces.splice(gone, 1)
+  const purge = await internals.purge(ctx, {
+    sessionId: KEEP,
+    include: { record: true, cache: true, children: false, attachments: false },
+  })
+  equal('the second purge succeeds', purge.ok, true)
+  const before = ctx.created.length
+  const restored = await internals.restoreGroups(ctx, HOME, { groupKey: purge.trash.groupKey })
+  equal('nothing failed', restored.failed.length, 0)
+  equal('a workspace is recreated for the directory', ctx.created.length, before + 1)
+  equal('the restored group reports the recreation',
+    restored.groups[0].sessions[0].workspace.status, 'created')
+  check('the conversation log is back', existsSync(join(HOME, 'sessions', PROJECT, KEEP)))
+})
+
+await group('a restore with a missing directory leaves the conversation ungrouped', async () => {
+  const PURGE_DIR = join(ROOT, 'vanishing-workspace')
+  mkdirSync(PURGE_DIR, { recursive: true })
+  const file = join(PURGE_DIR, 'gone.txt')
+  writeFileSync(file, 'will be deleted with its directory\n', 'utf8')
+  const id = seedExtra('session-vanishing-7777', PURGE_DIR, file)
+  const workspace = ctx.addWorkspace(realpathSync(PURGE_DIR), 'vanishing')
+  // Only the conversation itself: the group must hold nothing that would
+  // recreate the working directory, or the "directory is gone" branch cannot run.
+  const purge = await internals.purge(ctx, {
+    sessionId: id,
+    include: { record: true, cache: true, children: false, attachments: false },
+  })
+  equal('the purge succeeds', purge.ok, true)
+  rmSync(PURGE_DIR, { recursive: true, force: true })
+  const index = ctx.workspaces.indexOf(workspace)
+  if (index !== -1) ctx.workspaces.splice(index, 1)
+
+  const createdBefore = ctx.created.length
+  const restored = await internals.restoreGroups(ctx, HOME, { groupKey: purge.trash.groupKey })
+  equal('nothing failed', restored.failed.length, 0)
+  check('the conversation log is back', existsSync(join(HOME, 'sessions', PROJECT, id)))
+  const slot = restored.groups[0].sessions[0].workspace
+  // Rewriting the stored cwd to force it into some other workspace would change
+  // the conversation permanently, so the honest answer is Ungrouped plus a reason.
+  equal('the conversation is left ungrouped', slot.status, 'ungrouped')
+  check('the reason names the missing directory', String(slot.reason).includes(PURGE_DIR))
+  equal('no workspace was invented for a missing directory', ctx.created.length, createdBefore)
+})
+
+await group('a restore handles several groups at once', async () => {
+  const A_DIR = join(ROOT, 'batch-a')
+  const B_DIR = join(ROOT, 'batch-b')
+  mkdirSync(A_DIR, { recursive: true })
+  mkdirSync(B_DIR, { recursive: true })
+  const fileA = join(A_DIR, 'a.txt')
+  const fileB = join(B_DIR, 'b.txt')
+  writeFileSync(fileA, 'a\n', 'utf8')
+  writeFileSync(fileB, 'b\n', 'utf8')
+  const idA = seedExtra('session-batch-a-8888', A_DIR, fileA)
+  const idB = seedExtra('session-batch-b-9999', B_DIR, fileB)
+  const purgeA = await internals.purge(ctx, { sessionId: idA, include: { record: true, cache: true, children: false, attachments: false }, artifactIds: (await internals.buildPlan(ctx, idA)).artifacts.items.map(row => row.id) })
+  const purgeB = await internals.purge(ctx, { sessionId: idB, include: { record: true, cache: true, children: false, attachments: false }, artifactIds: (await internals.buildPlan(ctx, idB)).artifacts.items.map(row => row.id) })
+  equal('both purges succeeded', `${String(purgeA.ok)}:${String(purgeB.ok)}`, 'true:true')
+  check('both groups are distinct', purgeA.trash.groupKey !== purgeB.trash.groupKey)
+
+  const restored = await internals.restoreGroups(ctx, HOME, {
+    groupKeys: [purgeA.trash.groupKey, purgeB.trash.groupKey],
+  })
+  equal('nothing failed', restored.failed.length, 0)
+  equal('both groups are reported', restored.groups.length, 2)
+  check('both groups are dropped once empty', restored.groups.every(row => row.groupRemoved === true))
+  check('both conversations are back',
+    existsSync(join(HOME, 'sessions', PROJECT, idA)) && existsSync(join(HOME, 'sessions', PROJECT, idB)))
+  check('both files are back', existsSync(fileA) && existsSync(fileB))
+
+  // A mixed request: one whole group through `groups`, and one item of another
+  // group through the legacy single-group shape. Both must land in one pass.
+  const againA = await internals.purge(ctx, { sessionId: idA, include: { record: true, cache: true, children: false, attachments: false }, artifactIds: (await internals.buildPlan(ctx, idA)).artifacts.items.map(row => row.id) })
+  const againB = await internals.purge(ctx, { sessionId: idB, include: { record: true, cache: true, children: false, attachments: false }, artifactIds: (await internals.buildPlan(ctx, idB)).artifacts.items.map(row => row.id) })
+  const manifestB = JSON.parse(readFileSync(join(internals.trashGroups(HOME), againB.trash.groupKey, 'manifest.json'), 'utf8'))
+  const fileItem = manifestB.items.find(item => item.role === 'file')
+  check('the second group holds a produced file', fileItem !== undefined)
+
+  const wholeOnly = await internals.restoreGroups(ctx, HOME, {
+    groups: [{ groupKey: againA.trash.groupKey }],
+  })
+  equal('the groups-shaped request restores its group', wholeOnly.groups.length, 1)
+  equal('and that group is dropped once empty', wholeOnly.groups[0].groupRemoved, true)
+
+  const single = await internals.restoreGroups(ctx, HOME, {
+    groupKey: againB.trash.groupKey,
+    itemPaths: [fileItem.path],
+  })
+  equal('one item is restored', single.restored.length, 1)
+  equal('the group survives while its conversation stays in the bin',
+    single.groups[0].groupRemoved, false)
+  check('the conversation of the partial group stays deleted',
+    !existsSync(join(HOME, 'sessions', PROJECT, idB)))
+})
+
+await group('a restore refuses a request that names nothing', async () => {
+  let threw = null
+  try {
+    await internals.restoreGroups(ctx, HOME, {})
+  } catch (error) {
+    threw = error
+  }
+  check('an empty restore request is rejected', threw !== null)
+  let rejected = null
+  try {
+    await internals.restoreGroups(ctx, HOME, { groupKeys: ['../escape'] })
+  } catch (error) {
+    rejected = error
+  }
+  check('a traversal-shaped group key is rejected', rejected !== null)
+})
+
+await group('the group row derives roles from an older manifest', () => {
+  // A group written by 1.1.0 has neither `roles` nor `recordIncluded`. The panel
+  // still has to label it, so both are derived from the item kinds.
+  const legacy = {
+    groupKey: 'legacy-group',
+    sessionId: 'session-legacy',
+    cwd: WORKSPACE,
+    deletedAt: Date.now(),
+    bytes: 10,
+    items: [
+      { path: 'store/p/s', kind: 'store', originalPath: join(WORKSPACE, 'store'), bytes: 5 },
+      { path: 'artifacts/0/f.ts', kind: 'artifact', originalPath: files.produced2, bytes: 5 },
+    ],
+  }
+  const row = internals.groupRow(legacy, { retentionDays: 30, maxBytes: 0 }, true)
+  equal('an old group is still recognised as holding its conversation', row.recordIncluded, true)
+  equal('its conversation items are counted', row.roles.record, 1)
+  equal('its produced files are counted', row.roles.file, 1)
+  equal('its produced bytes are counted', row.fileBytes, 5)
+  equal('its items carry a derived role', row.items.map(item => item.role).join(','), 'record,file')
+  equal('an old group with no workspace snapshot reports none', row.workspace, null)
+})
+
+await group('the scan route reports the workspace slot', async () => {
+  const slot = ctx.addWorkspace(realpathSync(WORKSPACE), 'scan-workspace')
+  headers[SESSIONS.other] = { version: 4, id: SESSIONS.other, createdAt: 1500, cwd: WORKSPACE, isSeeded: false }
+  mkdirSync(join(HOME, 'sessions', PROJECT, SESSIONS.other), { recursive: true })
+  refreshStored()
+  const { payload } = await callRoute('/plugins/dsh-plugin-remover/api/scan', { sessionId: SESSIONS.other })
+  check('the response carries the workspace slot', 'workspace' in payload)
+  equal('the slot names the owning workspace', payload.workspace?.id, slot.id)
+  const direct = await internals.buildPlan(ctx, SESSIONS.other)
+  equal('the route forwards the same slot buildPlan computed', payload.workspace?.id, direct.workspace?.id)
 })
 
 // ---------------------------------------------------------------------------
